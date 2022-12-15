@@ -76,6 +76,7 @@ use pci::{
 use seccompiler::SeccompAction;
 use std::collections::HashMap;
 use std::convert::TryInto;
+use std::ffi::CString;
 use std::fs::{read_link, File, OpenOptions};
 use std::io::{self, stdout, Seek, SeekFrom};
 use std::mem::zeroed;
@@ -460,6 +461,8 @@ pub enum DeviceManagerError {
 
     /// Cannot duplicate file descriptor
     DupFd(vmm_sys_util::errno::Error),
+
+    MemFdCreate(io::Error),
 }
 pub type DeviceManagerResult<T> = result::Result<T, DeviceManagerError>;
 
@@ -2374,8 +2377,35 @@ impl DeviceManager {
                         .unwrap()
                         .allocate(None, size as GuestUsize, Some(0x0020_0000))
                         .ok_or(DeviceManagerError::FsRangeAllocation)?;
+                    info!("dax cache addr {} size {}", base.raw_value(), size);
 
                     (base.raw_value(), size)
+                };
+
+                let file_offset = {
+                    let fd = nix::sys::memfd::memfd_create(
+                        // safe to unwrap, no nul byte in file name
+                        &CString::new("virtio_fs_mem").unwrap(),
+                        nix::sys::memfd::MemFdCreateFlag::empty(),
+                    )
+                    .map_err(|e| {
+                        DeviceManagerError::MemFdCreate(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!("Failed to create memfd for virtiofs: {}", e.desc()),
+                        ))
+                    })?;
+                    let file: File = unsafe { File::from_raw_fd(fd) };
+                    file.set_len(cache_size).map_err(|e| {
+                        DeviceManagerError::MemFdCreate(io::Error::new(
+                            io::ErrorKind::Other,
+                            format!(
+                                "Failed to set_len on memfd for virtiofs: {}",
+                                e.raw_os_error().unwrap()
+                            ),
+                        ))
+                    })?;
+                    info!("Created memfd for virtiofs");
+                    Some(FileOffset::new(file, 0))
                 };
 
                 // Update the node with correct resource information.
@@ -2385,10 +2415,10 @@ impl DeviceManager {
                 });
 
                 let mmap_region = MmapRegion::build(
-                    None,
+                    file_offset,
                     cache_size as usize,
                     libc::PROT_NONE,
-                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
+                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE | libc::MAP_NORESERVE,
                 )
                 .map_err(DeviceManagerError::NewMmapRegion)?;
                 let host_addr: u64 = mmap_region.as_ptr() as u64;

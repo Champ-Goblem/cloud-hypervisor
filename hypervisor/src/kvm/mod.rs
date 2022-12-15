@@ -334,6 +334,8 @@ impl vm::Vm for KvmVm {
             region.flags = 0;
         }
 
+        info!("Inserting region {:?}", region);
+
         // SAFETY: Safe because guest regions are guaranteed not to overlap.
         unsafe {
             self.fd
@@ -1084,10 +1086,16 @@ impl cpu::Vcpu for KvmVcpu {
 
             Err(ref e) => match e.errno() {
                 libc::EAGAIN | libc::EINTR => Ok(cpu::VmExit::Ignore),
-                _ => Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
-                    "VCPU error {:?}",
-                    e
-                ))),
+                _ => {
+                    debug!("Failed vcpu run {:?}", self.fd);
+                    Err(cpu::HypervisorCpuError::RunVcpu(anyhow!(
+                        "VCPU error regs {:?} debug_regs {:?} events {:?} err {:?}",
+                        self.fd.get_regs(),
+                        self.fd.get_debug_regs(),
+                        self.fd.get_vcpu_events(),
+                        e
+                    )))
+                }
             },
         }
     }

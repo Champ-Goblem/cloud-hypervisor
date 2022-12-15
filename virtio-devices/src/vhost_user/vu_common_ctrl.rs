@@ -205,6 +205,12 @@ impl VhostUserHandle {
         for (queue_index, queue) in queues.into_iter().enumerate() {
             let actual_size: usize = queue.max_size().try_into().unwrap();
 
+            info!(
+                "setup_vhost_user: addr {} mem {:?}",
+                queue.state.desc_table.raw_value(),
+                mem
+            );
+
             let config_data = VringConfigData {
                 queue_max_size: queue.max_size(),
                 queue_size: queue.max_size(),

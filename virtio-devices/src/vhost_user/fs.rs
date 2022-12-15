@@ -62,6 +62,7 @@ struct SlaveReqHandler {
 impl SlaveReqHandler {
     // Make sure request is within cache range
     fn is_req_valid(&self, offset: u64, len: u64) -> bool {
+        info!("fs: is_req_valid");
         let end = match offset.checked_add(len) {
             Some(n) => n,
             None => return false,
@@ -73,12 +74,12 @@ impl SlaveReqHandler {
 
 impl VhostUserMasterReqHandler for SlaveReqHandler {
     fn handle_config_change(&self) -> HandlerResult<u64> {
-        debug!("handle_config_change");
+        info!("handle_config_change");
         Ok(0)
     }
 
     fn fs_slave_map(&self, fs: &VhostUserFSSlaveMsg, fd: &dyn AsRawFd) -> HandlerResult<u64> {
-        debug!("fs_slave_map");
+        info!("fs_slave_map");
 
         for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
             let offset = fs.cache_offset[i];
@@ -95,6 +96,10 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
 
             let addr = self.mmap_cache_addr + offset;
             let flags = fs.flags[i];
+            info!(
+                "map: addr {} flags {:?} len {} fd_offset {:?} cache_offset {:?} mmap_cache_addr {}",
+                addr, flags, len, fs.fd_offset[i] as libc::off_t, offset, self.mmap_cache_addr
+            );
             let ret = unsafe {
                 libc::mmap(
                     addr as *mut libc::c_void,
@@ -108,21 +113,16 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
             if ret == libc::MAP_FAILED {
                 return Err(io::Error::last_os_error());
             }
-
-            let ret = unsafe { libc::close(fd.as_raw_fd()) };
-            if ret == -1 {
-                return Err(io::Error::last_os_error());
-            }
         }
 
         Ok(0)
     }
 
     fn fs_slave_unmap(&self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
-        debug!("fs_slave_unmap");
+        info!("fs_slave_unmap");
 
         for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
-            let offset = fs.cache_offset[i];
+            let mut offset = fs.cache_offset[i];
             let mut len = fs.len[i];
 
             // Ignore if the length is 0.
@@ -134,6 +134,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
             // of the entire mapping.
             if len == 0xffff_ffff_ffff_ffff {
                 len = self.cache_size;
+                offset = 0;
             }
 
             if !self.is_req_valid(offset, len) {
@@ -160,7 +161,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
     }
 
     fn fs_slave_sync(&self, fs: &VhostUserFSSlaveMsg) -> HandlerResult<u64> {
-        debug!("fs_slave_sync");
+        info!("fs_slave_sync");
 
         for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
             let offset = fs.cache_offset[i];
@@ -187,7 +188,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
     }
 
     fn fs_slave_io(&self, fs: &VhostUserFSSlaveMsg, fd: &dyn AsRawFd) -> HandlerResult<u64> {
-        debug!("fs_slave_io");
+        info!("fs_slave_io");
 
         let mut done: u64 = 0;
         for i in 0..VHOST_USER_FS_SLAVE_ENTRIES {
@@ -232,7 +233,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
                 let ret = if (fs.flags[i] & VhostUserFSSlaveMsgFlags::MAP_W)
                     == VhostUserFSSlaveMsgFlags::MAP_W
                 {
-                    debug!("write: foffset={}, len={}", foffset, len);
+                    info!("write: foffset={}, len={}", foffset, len);
                     unsafe {
                         pwrite64(
                             fd.as_raw_fd(),
@@ -242,7 +243,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
                         )
                     }
                 } else {
-                    debug!("read: foffset={}, len={}", foffset, len);
+                    info!("read: foffset={}, len={}", foffset, len);
                     unsafe {
                         pread64(
                             fd.as_raw_fd(),
@@ -254,10 +255,13 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
                 };
 
                 if ret < 0 {
-                    return Err(io::Error::last_os_error());
+                    let err = io::Error::last_os_error();
+                    error!("Failed to process fs_slave_io {:?}", err.raw_os_error());
+                    return Err(err);
                 }
 
                 if ret == 0 {
+                    error!("Failed to process fs_slave_io EOF");
                     // EOF
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -271,11 +275,7 @@ impl VhostUserMasterReqHandler for SlaveReqHandler {
             }
         }
 
-        let ret = unsafe { libc::close(fd.as_raw_fd()) };
-        if ret == -1 {
-            return Err(io::Error::last_os_error());
-        }
-
+        info!("fs_slave_io: Written: {}", done);
         Ok(done)
     }
 }
@@ -327,6 +327,7 @@ impl Fs {
         restoring: bool,
         exit_evt: EventFd,
     ) -> Result<Fs> {
+        info!("fs: new");
         let mut slave_req_support = false;
 
         // Calculate the actual number of queues needed.
@@ -442,6 +443,7 @@ impl Fs {
     }
 
     fn state(&self) -> State {
+        info!("fs: state");
         State {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
@@ -453,6 +455,7 @@ impl Fs {
     }
 
     fn set_state(&mut self, state: &State) {
+        info!("fs: set_state");
         self.common.avail_features = state.avail_features;
         self.common.acked_features = state.acked_features;
         self.config = state.config;
@@ -483,22 +486,27 @@ impl Drop for Fs {
 
 impl VirtioDevice for Fs {
     fn device_type(&self) -> u32 {
+        info!("fs: device_type");
         self.common.device_type
     }
 
     fn queue_max_sizes(&self) -> &[u16] {
+        info!("fs: queue_max_sizes");
         &self.common.queue_sizes
     }
 
     fn features(&self) -> u64 {
+        info!("fs: features");
         self.common.avail_features
     }
 
     fn ack_features(&mut self, value: u64) {
+        info!("fs: ack_features");
         self.common.ack_features(value)
     }
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
+        info!("fs: read_config");
         self.read_config_from_slice(self.config.as_slice(), offset, data);
     }
 
@@ -509,6 +517,7 @@ impl VirtioDevice for Fs {
         queues: Vec<Queue<GuestMemoryAtomic<GuestMemoryMmap>>>,
         queue_evts: Vec<EventFd>,
     ) -> ActivateResult {
+        info!("fs: activate");
         self.common.activate(&queues, &queue_evts, &interrupt_cb)?;
         self.guest_memory = Some(mem.clone());
 
@@ -580,6 +589,7 @@ impl VirtioDevice for Fs {
     }
 
     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {
+        info!("fs: reset");
         // We first must resume the virtio thread if it was paused.
         if self.common.pause_evt.take().is_some() {
             self.common.resume().ok()?;
@@ -608,10 +618,12 @@ impl VirtioDevice for Fs {
     }
 
     fn shutdown(&mut self) {
+        info!("fs: shutdown");
         self.vu_common.shutdown()
     }
 
     fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
+        info!("fs: get_shm_regions");
         self.cache.as_ref().map(|cache| cache.0.clone())
     }
 
@@ -619,6 +631,7 @@ impl VirtioDevice for Fs {
         &mut self,
         shm_regions: VirtioSharedMemoryList,
     ) -> std::result::Result<(), crate::Error> {
+        info!("fs: set_shm_regions");
         if let Some(mut cache) = self.cache.as_mut() {
             cache.0 = shm_regions;
             Ok(())
@@ -631,10 +644,12 @@ impl VirtioDevice for Fs {
         &mut self,
         region: &Arc<GuestRegionMmap>,
     ) -> std::result::Result<(), crate::Error> {
+        info!("fs: add_memory_region");
         self.vu_common.add_memory_region(&self.guest_memory, region)
     }
 
     fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
+        info!("fs: userspace_mappings");
         let mut mappings = Vec::new();
         if let Some(cache) = self.cache.as_ref() {
             mappings.push(UserspaceMapping {
@@ -652,11 +667,13 @@ impl VirtioDevice for Fs {
 
 impl Pausable for Fs {
     fn pause(&mut self) -> result::Result<(), MigratableError> {
+        info!("fs: pause");
         self.vu_common.pause()?;
         self.common.pause()
     }
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
+        info!("fs: resume");
         self.common.resume()?;
 
         if let Some(epoll_thread) = &self.epoll_thread {
@@ -669,14 +686,17 @@ impl Pausable for Fs {
 
 impl Snapshottable for Fs {
     fn id(&self) -> String {
+        info!("fs: id");
         self.id.clone()
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
+        info!("fs: snapshot");
         self.vu_common.snapshot(&self.id(), &self.state())
     }
 
     fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
+        info!("fs: restore");
         self.set_state(&snapshot.to_versioned_state(&self.id)?);
         Ok(())
     }
@@ -685,22 +705,27 @@ impl Transportable for Fs {}
 
 impl Migratable for Fs {
     fn start_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
+        info!("fs: start_dirty_log");
         self.vu_common.start_dirty_log(&self.guest_memory)
     }
 
     fn stop_dirty_log(&mut self) -> std::result::Result<(), MigratableError> {
+        info!("fs: stop_dirty_log");
         self.vu_common.stop_dirty_log()
     }
 
     fn dirty_log(&mut self) -> std::result::Result<MemoryRangeTable, MigratableError> {
+        info!("fs: dirty_log");
         self.vu_common.dirty_log(&self.guest_memory)
     }
 
     fn start_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        info!("fs: start_migration");
         self.vu_common.start_migration()
     }
 
     fn complete_migration(&mut self) -> std::result::Result<(), MigratableError> {
+        info!("fs: complete_migration");
         self.vu_common
             .complete_migration(self.common.kill_evt.take())
     }

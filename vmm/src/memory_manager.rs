@@ -1305,6 +1305,7 @@ impl MemoryManager {
 
     // Update the GuestMemoryMmap with the new range
     fn add_region(&mut self, region: Arc<GuestRegionMmap>) -> Result<(), Error> {
+        info!("add_region region {:?}", region);
         let guest_memory = self
             .guest_memory
             .memory()
