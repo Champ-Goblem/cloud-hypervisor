@@ -37,3 +37,5 @@ vm-memory = { version = "0.10.0", features = ["backend-mmap", "backend-atomic", 
 vm-migration = { path = "../vm-migration" }
 vm-virtio = { path = "../vm-virtio" }
 vmm-sys-util = "0.11.0"
+fuse-backend-rs = {features = ["virtiofs"], path = "../../fuse-backend-rs"}
+vhost-user-backend = "0.8.0"

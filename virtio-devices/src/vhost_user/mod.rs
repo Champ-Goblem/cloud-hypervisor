@@ -31,11 +31,13 @@ use vu_common_ctrl::VhostUserHandle;
 
 pub mod blk;
 pub mod fs;
+mod inline_fs;
 pub mod net;
 pub mod vu_common_ctrl;
 
 pub use self::blk::Blk;
 pub use self::fs::*;
+pub use self::inline_fs::*;
 pub use self::net::Net;
 pub use self::vu_common_ctrl::VhostUserConfig;
 
