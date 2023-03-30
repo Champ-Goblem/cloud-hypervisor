@@ -76,7 +76,7 @@ use tracer::trace_scoped;
 use vfio_ioctls::{VfioContainer, VfioDevice, VfioDeviceFd};
 use virtio_devices::transport::VirtioTransport;
 use virtio_devices::transport::{VirtioPciDevice, VirtioPciDeviceActivator};
-use virtio_devices::vhost_user::VhostUserConfig;
+use virtio_devices::vhost_user::{InlineFS, VhostUserConfig};
 use virtio_devices::{
     AccessPlatformMapping, ActivateError, VdpaDmaMapping, VirtioMemMappingSource,
 };
@@ -154,6 +154,8 @@ pub enum DeviceManagerError {
 
     /// Cannot create virtio-fs device
     CreateVirtioFs(virtio_devices::vhost_user::Error),
+
+    CreateInlineVirtioFS(io::Error),
 
     /// Virtio-fs device was created without a socket.
     NoVirtioFsSock,
@@ -2525,24 +2527,57 @@ impl DeviceManager {
 
         let mut node = device_node!(id);
 
-        if let Some(fs_socket) = fs_cfg.socket.to_str() {
+        if !fs_cfg.inline {
+            if let Some(fs_socket) = fs_cfg.socket.to_str() {
+                let virtio_fs_device = Arc::new(Mutex::new(
+                    virtio_devices::vhost_user::Fs::new(
+                        id.clone(),
+                        fs_socket,
+                        &fs_cfg.tag,
+                        fs_cfg.num_queues,
+                        fs_cfg.queue_size,
+                        None,
+                        self.seccomp_action.clone(),
+                        self.exit_evt
+                            .try_clone()
+                            .map_err(DeviceManagerError::EventFd)?,
+                        self.force_iommu,
+                        versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
+                            .map_err(DeviceManagerError::RestoreGetState)?,
+                    )
+                    .map_err(DeviceManagerError::CreateVirtioFs)?,
+                ));
+
+                // Update the device tree with the migratable device.
+                node.migratable = Some(Arc::clone(&virtio_fs_device) as Arc<Mutex<dyn Migratable>>);
+                self.device_tree.lock().unwrap().insert(id.clone(), node);
+
+                Ok(MetaVirtioDevice {
+                    virtio_device: Arc::clone(&virtio_fs_device)
+                        as Arc<Mutex<dyn virtio_devices::VirtioDevice>>,
+                    iommu: false,
+                    id,
+                    pci_segment: fs_cfg.pci_segment,
+                    dma_handler: None,
+                })
+            } else {
+                Err(DeviceManagerError::NoVirtioFsSock)
+            }
+        } else {
             let virtio_fs_device = Arc::new(Mutex::new(
-                virtio_devices::vhost_user::Fs::new(
+                virtio_devices::vhost_user::InlineFS::new(
                     id.clone(),
-                    fs_socket,
                     &fs_cfg.tag,
                     fs_cfg.num_queues,
                     fs_cfg.queue_size,
                     None,
-                    self.seccomp_action.clone(),
                     self.exit_evt
                         .try_clone()
                         .map_err(DeviceManagerError::EventFd)?,
+                    self.seccomp_action.clone(),
                     self.force_iommu,
-                    versioned_state_from_id(self.snapshot.as_ref(), id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
                 )
-                .map_err(DeviceManagerError::CreateVirtioFs)?,
+                .map_err(DeviceManagerError::CreateInlineVirtioFS)?,
             ));
 
             // Update the device tree with the migratable device.
@@ -2557,8 +2592,6 @@ impl DeviceManager {
                 pci_segment: fs_cfg.pci_segment,
                 dma_handler: None,
             })
-        } else {
-            Err(DeviceManagerError::NoVirtioFsSock)
         }
     }
 

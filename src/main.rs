@@ -185,7 +185,7 @@ pub struct TopLevel {
     balloon: Option<String>,
 
     #[argh(option, long = "fs")]
-    /// tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>
+    /// tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>,inline=<inline>
     fs: Vec<String>,
 
     #[argh(option, long = "pmem")]

@@ -31,7 +31,7 @@ use vu_common_ctrl::VhostUserHandle;
 
 pub mod blk;
 pub mod fs;
-mod inline_fs;
+pub mod inline_fs;
 pub mod net;
 pub mod vu_common_ctrl;
 

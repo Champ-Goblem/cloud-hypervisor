@@ -1230,11 +1230,22 @@ impl FsConfig {
             .add("num_queues")
             .add("socket")
             .add("id")
-            .add("pci_segment");
+            .add("pci_segment")
+            .add("inline");
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
         let tag = parser.get("tag").ok_or(Error::ParseFsTagMissing)?;
-        let socket = PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?);
+
+        let inline: bool = parser
+            .convert("inline")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or_default();
+
+        let socket = if !inline {
+            PathBuf::from(parser.get("socket").ok_or(Error::ParseFsSockMissing)?)
+        } else {
+            PathBuf::new()
+        };
 
         let queue_size = parser
             .convert("queue_size")
@@ -1259,6 +1270,7 @@ impl FsConfig {
             queue_size,
             id,
             pci_segment,
+            inline,
         })
     }
 
