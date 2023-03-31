@@ -390,6 +390,14 @@ pub struct FsConfig {
     pub pci_segment: u16,
     #[serde(default)]
     pub inline: bool,
+    #[serde(default)]
+    pub source_path: Option<String>,
+    #[serde(default)]
+    pub mount_path: Option<String>,
+    #[serde(default)]
+    pub dax: bool,
+    #[serde(default)]
+    pub cache_size: u64,
 }
 
 pub fn default_fsconfig_num_queues() -> usize {
@@ -410,6 +418,10 @@ impl Default for FsConfig {
             id: None,
             pci_segment: 0,
             inline: false,
+            source_path: None,
+            mount_path: None,
+            dax: false,
+            cache_size: 0x0002_0000_0000,
         }
     }
 }

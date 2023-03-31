@@ -98,6 +98,8 @@ pub enum Error {
     ParseTpm(OptionParserError),
     /// Missing path for TPM device
     ParseTpmPathMissing,
+    /// Invalid cache size for dax on
+    InvalidCacheSize,
 }
 
 #[derive(Debug, PartialEq, Eq, Error)]
@@ -336,6 +338,7 @@ impl fmt::Display for Error {
             ParseVdpaPathMissing => write!(f, "Error parsing --vdpa: path missing"),
             ParseTpm(o) => write!(f, "Error parsing --tpm: {o}"),
             ParseTpmPathMissing => write!(f, "Error parsing --tpm: path missing"),
+            InvalidCacheSize => write!(f, "Invalid cache size when dax is on"),
         }
     }
 }
@@ -1231,7 +1234,11 @@ impl FsConfig {
             .add("socket")
             .add("id")
             .add("pci_segment")
-            .add("inline");
+            .add("inline")
+            .add("source_path")
+            .add("mount_path")
+            .add("dax")
+            .add("cache_size");
         parser.parse(fs).map_err(Error::ParseFileSystem)?;
 
         let tag = parser.get("tag").ok_or(Error::ParseFsTagMissing)?;
@@ -1263,6 +1270,28 @@ impl FsConfig {
             .map_err(Error::ParseFileSystem)?
             .unwrap_or_default();
 
+        let (source_path, mount_path) = if inline {
+            (parser.get("source_path"), parser.get("mount_path"))
+        } else {
+            (None, None)
+        };
+
+        let dax = parser
+            .convert::<Toggle>("dax")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(Toggle(false))
+            .0;
+
+        let cache_size = parser
+            .convert::<ByteSized>("cache_size")
+            .map_err(Error::ParseFileSystem)?
+            .unwrap_or(ByteSized(0))
+            .0;
+
+        if dax && cache_size == 0 {
+            return Err(Error::InvalidCacheSize);
+        }
+
         Ok(FsConfig {
             tag,
             socket,
@@ -1271,6 +1300,10 @@ impl FsConfig {
             id,
             pci_segment,
             inline,
+            source_path,
+            mount_path,
+            dax,
+            cache_size,
         })
     }
 
