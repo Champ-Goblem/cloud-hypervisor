@@ -1,19 +1,23 @@
 use anyhow::anyhow;
 use fuse_backend_rs::abi::virtio_fs::{RemovemappingOne, SetupmappingFlags};
 use fuse_backend_rs::passthrough::{Config, PassthroughFs};
+use std::ops::Deref;
 use std::os::unix::prelude::{AsRawFd, RawFd};
 use std::result;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier};
 use vhost::vhost_user::message::VhostUserFSSlaveMsgFlags;
 use vhost::vhost_user::VhostUserProtocolFeatures;
+use virtio_queue::Error as VQError;
 
 use crate::seccomp_filters::Thread;
 use crate::thread_helper::spawn_virtio_thread;
 use crate::{
     EpollHelper, EpollHelperError, EpollHelperHandler, GuestMemoryMmap, MmapRegion,
     UserspaceMapping, VirtioCommon, VirtioDevice, VirtioInterrupt, VirtioInterruptType,
-    VirtioSharedMemoryList, EPOLL_HELPER_EVENT_LAST, VIRTIO_F_IOMMU_PLATFORM, VIRTIO_F_VERSION_1,
+    VirtioSharedMemoryList, EPOLL_HELPER_EVENT_LAST, VIRTIO_F_IN_ORDER, VIRTIO_F_IOMMU_PLATFORM,
+    VIRTIO_F_NOTIFICATION_DATA, VIRTIO_F_ORDER_PLATFORM, VIRTIO_F_RING_EVENT_IDX,
+    VIRTIO_F_RING_INDIRECT_DESC, VIRTIO_F_VERSION_1,
 };
 
 use super::fs::VirtioFsConfig;
@@ -53,6 +57,10 @@ enum Error {
     InvalidFlags,
     MmapFailed(IOError),
     MunmapFailed(IOError),
+    DisableNotifications(VQError),
+    EnableNotifications(VQError),
+    AddUsed(VQError),
+    NeedsNotify(VQError),
 }
 
 impl From<Error> for IOError {
@@ -115,13 +123,13 @@ impl FsCacheReqHandler for SlaveReqHandler {
         let flags = VhostUserFSSlaveMsgFlags::from_bits(flags)
             .ok_or_else(|| IOError::from(Error::InvalidFlags))?;
 
-        let mut prot = if (flags & VhostUserFSSlaveMsgFlags::MAP_R).bits() != 0 {
+        let mut prot = if flags.bits() & SetupmappingFlags::READ.bits() != 0 {
             PROT_READ
         } else {
             0
         };
 
-        prot |= if (flags & VhostUserFSSlaveMsgFlags::MAP_W).bits() != 0 {
+        prot |= if flags.bits() & SetupmappingFlags::WRITE.bits() != 0 {
             PROT_WRITE
         } else {
             0
@@ -309,7 +317,6 @@ pub struct InlineFS {
     server: Arc<Server<Arc<Vfs>>>,
     id: String,
     config: VirtioFsConfig,
-    event_idx: bool,
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
     iommu: bool,
@@ -395,6 +402,11 @@ impl InlineFS {
 
         // Filling device and vring features VMM supports.
         let mut avail_features: u64 = 1 << VIRTIO_F_VERSION_1;
+        // | 1 << VIRTIO_F_RING_INDIRECT_DESC
+        // | 1 << VIRTIO_F_RING_EVENT_IDX
+        // | 1 << VIRTIO_F_IN_ORDER
+        // | 1 << VIRTIO_F_ORDER_PLATFORM
+        // | 1 << VIRTIO_F_NOTIFICATION_DATA;
         if iommu {
             avail_features |= 1 << VIRTIO_F_IOMMU_PLATFORM;
         }
@@ -418,7 +430,6 @@ impl InlineFS {
             id,
             config,
             cache,
-            event_idx: false,
             iommu,
             mem: None,
         })
@@ -457,8 +468,12 @@ impl VirtioDevice for InlineFS {
 
         let mut epoll_threads = Vec::new();
         for i in 0..queues.len() {
-            let (_, queue, queue_evt) = queues.remove(0);
+            let (_, mut queue, queue_evt) = queues.remove(0);
             let (kill_evt, pause_evt) = self.common.dup_eventfds();
+
+            let event_index = self.common.feature_acked(VIRTIO_F_RING_EVENT_IDX.into());
+            info!("event index {}", event_index);
+            queue.set_event_idx(event_index);
 
             let vu_req = self.cache.as_ref().map(|c| SlaveReqHandler {
                 cache_offset: c.0.addr,
@@ -477,6 +492,7 @@ impl VirtioDevice for InlineFS {
                 pause_evt,
                 server: self.server.clone(),
                 vu_req,
+                event_index,
             };
 
             let paused = self.common.paused.clone();
@@ -588,6 +604,7 @@ struct FsEpollHandler<F: FileSystem + Sync> {
     pause_evt: EventFd,
     server: Arc<Server<F>>,
     vu_req: Option<SlaveReqHandler>,
+    event_index: bool,
 }
 
 // New descriptors are pending on the virtio queue.
@@ -632,6 +649,12 @@ impl<F: FileSystem + Sync> FsEpollHandler<F> {
         // let mut cache_handler = self.cache_handler.clone();
         let mut used_descs = false;
 
+        if self.event_index {
+            queue
+                .disable_notification(self.mem.memory().deref())
+                .map_err(Error::DisableNotifications)?;
+        }
+
         while let Some(desc_chain) = queue.pop_descriptor_chain(self.mem.memory()) {
             let head_index = desc_chain.head_index();
 
@@ -643,7 +666,7 @@ impl<F: FileSystem + Sync> FsEpollHandler<F> {
                 .map_err(|_| Error::QueueWriter)
                 .unwrap();
 
-            info!("PROCESS_QUEUE");
+            debug!("PROCESS_QUEUE {}", self.queue_index);
 
             let len = self
                 .server
@@ -662,7 +685,18 @@ impl<F: FileSystem + Sync> FsEpollHandler<F> {
             used_descs = true;
         }
 
-        Ok(used_descs)
+        if self.event_index {
+            queue
+                .enable_notification(self.mem.memory().deref())
+                .map_err(Error::EnableNotifications)?;
+        }
+
+        if let Ok(needs_notification) = queue.needs_notification(self.mem.memory().deref()) {
+            return Ok(used_descs && needs_notification);
+        } else {
+            warn!("Failed needs notifications check");
+        }
+        Ok(false)
     }
 
     fn handle_event_impl(&mut self) -> result::Result<(), EpollHelperError> {
@@ -689,7 +723,6 @@ impl<F: FileSystem + Sync> EpollHelperHandler for FsEpollHandler<F> {
         let ev_type = event.data as u16;
         match ev_type {
             QUEUE_AVAIL_EVENT => {
-                info!("QUEUE EVT");
                 self.queue_evt.read().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get queue event: {:?}", e))
                 })?;
