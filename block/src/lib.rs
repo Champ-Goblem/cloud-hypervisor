@@ -27,6 +27,8 @@ pub mod raw_sync;
 pub mod vhd;
 pub mod vhdx;
 pub mod vhdx_sync;
+pub mod vmdk;
+pub mod vmdk_sync;
 
 use std::alloc::{Layout, alloc_zeroed, dealloc};
 use std::collections::VecDeque;
@@ -794,6 +796,7 @@ pub enum ImageType {
     Qcow2,
     Raw,
     Vhdx,
+    Vmdk,
 }
 
 const QCOW_MAGIC: u32 = 0x5146_49fb;
@@ -818,15 +821,33 @@ pub fn read_aligned_block_size(f: &mut File) -> std::io::Result<Vec<u8>> {
 
 /// Determine image type through file parsing.
 pub fn detect_image_type(f: &mut File) -> std::io::Result<ImageType> {
-    let block = read_aligned_block_size(f)?;
+    // Try to read aligned block size first (needed for O_DIRECT)
+    let block = match read_aligned_block_size(f) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            // File is smaller than block size (e.g., flat VMDK descriptors are ~350 bytes)
+            // Read the actual file size and pad with zeros
+            f.seek(SeekFrom::Start(0))?;
+            let file_size = f.metadata()?.len() as usize;
+            let mut buffer = vec![0u8; file_size.max(512)]; // At least 512 bytes for detection
+            let bytes_read = f.read(&mut buffer[..file_size])?;
+            buffer.truncate(bytes_read.max(512));
+            buffer
+        }
+        Err(e) => return Err(e),
+    };
 
     // Check 4 first bytes to get the header value and determine the image type
     let image_type = if u32::from_be_bytes(block[0..4].try_into().unwrap()) == QCOW_MAGIC {
         ImageType::Qcow2
-    } else if vhd::is_fixed_vhd(f)? {
+    } else if vhd::is_fixed_vhd(f).unwrap_or(false) {
+        // For small files (e.g., VMDK descriptors), is_fixed_vhd may fail when seeking
+        // from end. In such cases, assume it's not a VHD.
         ImageType::FixedVhd
     } else if u64::from_le_bytes(block[0..8].try_into().unwrap()) == VHDX_SIGN {
         ImageType::Vhdx
+    } else if vmdk::is_vmdk(&block) {
+        ImageType::Vmdk
     } else {
         ImageType::Raw
     };

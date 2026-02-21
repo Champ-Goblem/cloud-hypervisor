@@ -38,6 +38,7 @@ use block::qcow_sync::QcowDiskSync;
 use block::raw_async_aio::RawFileDiskAio;
 use block::raw_sync::RawFileDiskSync;
 use block::vhdx_sync::VhdxDiskSync;
+use block::vmdk_sync::FlatVmdkDiskSync;
 use block::{
     ImageType, block_aio_is_supported, block_io_uring_is_supported, detect_image_type, qcow, vhdx,
 };
@@ -574,6 +575,10 @@ pub enum DeviceManagerError {
     /// Failed to create FixedVhdxDiskSync
     #[error("Failed to create FixedVhdxDiskSync")]
     CreateFixedVhdxDiskSync(#[source] vhdx::VhdxError),
+
+    /// Failed to create VmdkDisk
+    #[error("Failed to create VmdkDisk")]
+    CreateVmdkDisk(#[source] std::io::Error),
 
     /// Failed to add DMA mapping handler to virtio-mem device.
     #[error("Failed to add DMA mapping handler to virtio-mem device")]
@@ -2655,20 +2660,23 @@ impl DeviceManager {
                 options.custom_flags(libc::O_DIRECT);
             }
             // Open block device path
-            let mut file: File = options
-                .open(
-                    disk_cfg
-                        .path
-                        .as_ref()
-                        .ok_or(DeviceManagerError::NoDiskPath)?
-                        .clone(),
-                )
-                .map_err(DeviceManagerError::Disk)?;
+            let disk_path = disk_cfg
+                .path
+                .as_ref()
+                .ok_or(DeviceManagerError::NoDiskPath)?
+                .clone();
+            let mut file: File = options.open(&disk_path).map_err(DeviceManagerError::Disk)?;
             let image_type =
                 detect_image_type(&mut file).map_err(DeviceManagerError::DetectImageType)?;
 
             if image_type != ImageType::Qcow2 && disk_cfg.backing_files {
                 warn!("Enabling backing_files option only applies for QCOW2 files");
+            }
+
+            // VMDK is read-only (flat VMDK only)
+            if image_type == ImageType::Vmdk && !disk_cfg.readonly {
+                warn!("VMDK images are read-only. Forcing readonly=true for disk '{id}'");
+                disk_cfg.readonly = true;
             }
 
             let image = match image_type {
@@ -2733,6 +2741,14 @@ impl DeviceManager {
                     Box::new(
                         VhdxDiskSync::new(file)
                             .map_err(DeviceManagerError::CreateFixedVhdxDiskSync)?,
+                    ) as Box<dyn DiskFile>
+                }
+                ImageType::Vmdk => {
+                    info!("Using read-only flat VMDK disk file");
+                    // VMDK is always read-only
+                    Box::new(
+                        FlatVmdkDiskSync::new(file, &disk_path)
+                            .map_err(DeviceManagerError::CreateVmdkDisk)?,
                     ) as Box<dyn DiskFile>
                 }
             };
